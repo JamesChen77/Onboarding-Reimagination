@@ -31,10 +31,12 @@ const DOCS_PATH   = '/documentation/01-Getting-Started/Login-to-PensionPro';
 const OUTPUT_DIR  = process.env.OUTPUT_DIR  || path.join(__dirname, 'output');
 const CONCURRENCY = parseInt(process.env.CONCURRENCY || '3', 10);
 const TIMEOUT_MS  = parseInt(process.env.TIMEOUT_MS  || '30000', 10);
-const DOCS_EMAIL  = process.env.DOCS_EMAIL  || '';
-const DOCS_PASS   = process.env.DOCS_PASS   || '';
-const DEBUG       = process.env.DEBUG === '1';
-const DEBUG_DIR   = path.join(OUTPUT_DIR, '_debug');
+const DOCS_EMAIL    = process.env.DOCS_EMAIL  || '';
+const DOCS_PASS     = process.env.DOCS_PASS   || '';
+const DEBUG         = process.env.DEBUG === '1';
+const DEBUG_DIR     = path.join(OUTPUT_DIR, '_debug');
+const RETRY_FAILED  = process.argv.includes('--retry-failed');
+const MAX_RETRIES   = 3;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -56,6 +58,8 @@ async function debugSnapshot(page, label) {
   fs.writeFileSync(path.join(DEBUG_DIR, `${safe}.html`), await page.content(), 'utf8');
   console.log(`  [debug] snapshot saved: _debug/${safe}.{png,html}`);
 }
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function waitForContent(page) {
   // Wait until the SPA's loading spinner disappears or main content appears.
@@ -208,13 +212,11 @@ async function discoverArticleLinks(ctx) {
 }
 
 // ---------------------------------------------------------------------------
-// Step 2 – Fetch and save one article
+// Step 2 – Fetch and save one article (with retries)
 // ---------------------------------------------------------------------------
 
-async function fetchArticle(ctx, url, index, total) {
-  console.log(`[fetch ${index}/${total}] ${url}`);
+async function fetchArticleOnce(ctx, url) {
   const page = await ctx.newPage();
-
   try {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: TIMEOUT_MS });
     await waitForContent(page);
@@ -245,13 +247,11 @@ async function fetchArticle(ctx, url, index, total) {
       const bodyText = contentEl ? contentEl.innerText.trim() : document.body.innerText.trim();
       const bodyHtml = contentEl ? contentEl.innerHTML.trim() : document.body.innerHTML.trim();
 
-      // Collect all headings to build a simple outline
       const headings = Array.from(document.querySelectorAll('h1, h2, h3, h4')).map(h => ({
         level: parseInt(h.tagName[1], 10),
         text: h.innerText.trim(),
       }));
 
-      // Collect all in-page links
       const links = Array.from(document.querySelectorAll('a[href]')).map(a => ({
         text: a.innerText.trim(),
         href: a.getAttribute('href'),
@@ -260,35 +260,50 @@ async function fetchArticle(ctx, url, index, total) {
       return { title, bodyText, bodyHtml, headings, links };
     });
 
-    const slug = slugify(url);
-    const result = {
-      url,
-      title: article.title,
-      fetchedAt: new Date().toISOString(),
-      headings: article.headings,
-      links: article.links,
-      bodyText: article.bodyText,
-    };
-
-    // Save JSON record
-    const jsonPath = path.join(OUTPUT_DIR, `${slug}.json`);
-    fs.writeFileSync(jsonPath, JSON.stringify(result, null, 2), 'utf8');
-
-    // Save plain-text for easy reading
-    const txtPath = path.join(OUTPUT_DIR, `${slug}.txt`);
-    fs.writeFileSync(
-      txtPath,
-      `URL: ${url}\nTitle: ${article.title}\nFetched: ${result.fetchedAt}\n\n${article.bodyText}`,
-      'utf8'
-    );
-
-    return { url, title: article.title, ok: true };
-  } catch (err) {
-    console.error(`  [error] ${url}: ${err.message}`);
-    return { url, ok: false, error: err.message };
+    return article;
   } finally {
     await page.close();
   }
+}
+
+async function fetchArticle(ctx, url, index, total) {
+  console.log(`[fetch ${index}/${total}] ${url}`);
+
+  let lastErr;
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const article = await fetchArticleOnce(ctx, url);
+
+      const slug = slugify(url);
+      const result = {
+        url,
+        title: article.title,
+        fetchedAt: new Date().toISOString(),
+        headings: article.headings,
+        links: article.links,
+        bodyText: article.bodyText,
+      };
+
+      fs.writeFileSync(path.join(OUTPUT_DIR, `${slug}.json`), JSON.stringify(result, null, 2), 'utf8');
+      fs.writeFileSync(
+        path.join(OUTPUT_DIR, `${slug}.txt`),
+        `URL: ${url}\nTitle: ${article.title}\nFetched: ${result.fetchedAt}\n\n${article.bodyText}`,
+        'utf8'
+      );
+
+      return { url, title: article.title, ok: true };
+    } catch (err) {
+      lastErr = err;
+      if (attempt < MAX_RETRIES) {
+        const wait = 2 ** attempt * 1000; // 2s, 4s
+        console.warn(`  [retry ${attempt}/${MAX_RETRIES - 1}] ${url} — waiting ${wait / 1000}s (${err.message})`);
+        await sleep(wait);
+      }
+    }
+  }
+
+  console.error(`  [error] ${url}: ${lastErr.message}`);
+  return { url, ok: false, error: lastErr.message };
 }
 
 // ---------------------------------------------------------------------------
@@ -326,13 +341,24 @@ async function runWithConcurrency(tasks, concurrency) {
     // 0. Log in so the context carries an authenticated session
     await login(ctx);
 
-    // 1. Discover all article URLs
-    let articleUrls = await discoverArticleLinks(ctx);
+    // 1. Determine which URLs to fetch
+    let articleUrls;
+    const manifestPath = path.join(OUTPUT_DIR, '_manifest.json');
 
-    if (articleUrls.length === 0) {
-      console.warn('\n[warn] No article links found via sidebar traversal.');
-      console.warn('       Falling back to the seed URL only.');
-      articleUrls = [`${BASE_URL}${DOCS_PATH}`];
+    if (RETRY_FAILED) {
+      if (!fs.existsSync(manifestPath)) {
+        throw new Error(`--retry-failed requires a previous manifest at ${manifestPath}`);
+      }
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+      articleUrls = manifest.filter(r => !r.ok).map(r => r.url);
+      console.log(`\n[main] Retrying ${articleUrls.length} previously failed article(s) …\n`);
+    } else {
+      articleUrls = await discoverArticleLinks(ctx);
+      if (articleUrls.length === 0) {
+        console.warn('\n[warn] No article links found via sidebar traversal.');
+        console.warn('       Falling back to the seed URL only.');
+        articleUrls = [`${BASE_URL}${DOCS_PATH}`];
+      }
     }
 
     // 2. Fetch each article
@@ -347,12 +373,18 @@ async function runWithConcurrency(tasks, concurrency) {
 
     const results = await runWithConcurrency(tasks, CONCURRENCY);
 
-    // 3. Write a summary manifest
-    const manifestPath = path.join(OUTPUT_DIR, '_manifest.json');
-    fs.writeFileSync(manifestPath, JSON.stringify(results, null, 2), 'utf8');
+    // 3. Merge results back into the manifest (preserving previous successes on retry)
+    let finalResults = results;
+    if (RETRY_FAILED && fs.existsSync(manifestPath)) {
+      const prev = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+      const retried = new Map(results.map(r => [r.url, r]));
+      finalResults = prev.map(r => retried.get(r.url) || r);
+    }
 
-    const ok  = results.filter(r => r.ok).length;
-    const bad = results.filter(r => !r.ok).length;
+    fs.writeFileSync(manifestPath, JSON.stringify(finalResults, null, 2), 'utf8');
+
+    const ok  = finalResults.filter(r => r.ok).length;
+    const bad = finalResults.filter(r => !r.ok).length;
     console.log(`\n[done] ${ok} succeeded, ${bad} failed.`);
     console.log(`[done] Output written to: ${OUTPUT_DIR}`);
     console.log(`[done] Manifest: ${manifestPath}`);
