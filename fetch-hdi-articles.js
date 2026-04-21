@@ -19,6 +19,7 @@
  *   TIMEOUT_MS  - navigation/selector timeout in ms (default: 30000)
  *   DOCS_EMAIL  - login email address (required)
  *   DOCS_PASS   - login password (required)
+ *   DEBUG       - set to "1" to save screenshots + HTML dumps at each step
  */
 
 const { chromium } = require('playwright');
@@ -32,6 +33,8 @@ const CONCURRENCY = parseInt(process.env.CONCURRENCY || '3', 10);
 const TIMEOUT_MS  = parseInt(process.env.TIMEOUT_MS  || '30000', 10);
 const DOCS_EMAIL  = process.env.DOCS_EMAIL  || '';
 const DOCS_PASS   = process.env.DOCS_PASS   || '';
+const DEBUG       = process.env.DEBUG === '1';
+const DEBUG_DIR   = path.join(OUTPUT_DIR, '_debug');
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -43,6 +46,15 @@ function slugify(url) {
 
 function ensureDir(dir) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+
+async function debugSnapshot(page, label) {
+  if (!DEBUG) return;
+  ensureDir(DEBUG_DIR);
+  const safe = label.replace(/[^a-zA-Z0-9_-]/g, '_');
+  await page.screenshot({ path: path.join(DEBUG_DIR, `${safe}.png`), fullPage: true });
+  fs.writeFileSync(path.join(DEBUG_DIR, `${safe}.html`), await page.content(), 'utf8');
+  console.log(`  [debug] snapshot saved: _debug/${safe}.{png,html}`);
 }
 
 async function waitForContent(page) {
@@ -76,6 +88,7 @@ async function login(ctx) {
 
     // Wait for the login form to appear
     await page.waitForSelector('input[type="email"], input[name="email"], input[placeholder*="Email" i]', { timeout: TIMEOUT_MS });
+    await debugSnapshot(page, '01_login_form');
 
     // Fill credentials
     const emailSel = 'input[type="email"], input[name="email"], input[placeholder*="Email" i]';
@@ -97,6 +110,7 @@ async function login(ctx) {
       () => !document.querySelector('input[type="password"]'),
       { timeout: TIMEOUT_MS }
     );
+    await debugSnapshot(page, '02_after_login');
 
     console.log('[login] Authenticated successfully.');
   } finally {
@@ -115,6 +129,7 @@ async function discoverArticleLinks(ctx) {
   try {
     await page.goto(`${BASE_URL}${DOCS_PATH}`, { waitUntil: 'domcontentloaded', timeout: TIMEOUT_MS });
     await waitForContent(page);
+    await debugSnapshot(page, '03_discover_before_expand');
 
     // Try to expand collapsed sidebar sections (accordion/tree nav patterns).
     // Click any nav toggles that aren't already open.
@@ -133,6 +148,7 @@ async function discoverArticleLinks(ctx) {
       });
     });
     await page.waitForTimeout(800);
+    await debugSnapshot(page, '04_discover_after_expand');
 
     // Collect every internal /documentation href.
     // Pass 1: standard <a href> tags.
@@ -167,11 +183,22 @@ async function discoverArticleLinks(ctx) {
     console.log(`[discover] Found ${unique.length} article link(s).`);
 
     if (unique.length === 0) {
-      // Debug dump: log all <a> hrefs so the caller can see what's available.
-      const allHrefs = await page.evaluate(() =>
-        Array.from(document.querySelectorAll('a[href]')).map(a => a.getAttribute('href'))
+      // Log all <a> hrefs to help diagnose selector mismatches.
+      const allAnchors = await page.evaluate(() =>
+        Array.from(document.querySelectorAll('a[href]')).map(a => ({
+          text: a.innerText.trim().slice(0, 60),
+          href: a.getAttribute('href'),
+        }))
       );
-      console.log('[discover] All <a href> values on page:', allHrefs.slice(0, 30));
+      console.log('[discover] All <a> tags on page (first 40):');
+      allAnchors.slice(0, 40).forEach(a => console.log(`  ${a.href}  "${a.text}"`));
+      if (DEBUG) {
+        fs.writeFileSync(
+          path.join(DEBUG_DIR, 'all_anchors.json'),
+          JSON.stringify(allAnchors, null, 2),
+          'utf8'
+        );
+      }
     }
 
     return unique;
