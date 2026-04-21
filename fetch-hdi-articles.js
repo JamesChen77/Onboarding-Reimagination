@@ -78,13 +78,14 @@ async function login(ctx) {
 
   try {
     await page.goto(`${BASE_URL}/documentation`, { waitUntil: 'domcontentloaded', timeout: TIMEOUT_MS });
-    await page.waitForSelector('input[type="email"], input[name="email"], input[placeholder*="Email" i]', { timeout: TIMEOUT_MS });
+    // Keycloak form: fields are name="username" and name="password"
+    await page.waitForSelector('#username, input[name="username"]', { timeout: TIMEOUT_MS });
     await debugSnapshot(page, '01_login_form');
 
-    await page.fill('input[type="email"], input[name="email"], input[placeholder*="Email" i]', DOCS_EMAIL);
-    await page.fill('input[type="password"]', DOCS_PASS);
+    await page.fill('#username, input[name="username"]', DOCS_EMAIL);
+    await page.fill('#password, input[name="password"]', DOCS_PASS);
 
-    const submitBtn = await page.$('button[type="submit"], input[type="submit"]');
+    const submitBtn = await page.$('#kc-login, button[type="submit"], input[type="submit"]');
     if (submitBtn) await submitBtn.click();
     else await page.keyboard.press('Enter');
 
@@ -92,7 +93,25 @@ async function login(ctx) {
       () => !document.querySelector('input[type="password"]'),
       { timeout: TIMEOUT_MS }
     );
+    await page.waitForTimeout(2000);
     await debugSnapshot(page, '02_after_login');
+
+    // Handle "Select Tenant" interstitial that appears after Keycloak login
+    const bodyText = await page.evaluate(() => document.body.innerText);
+    if (bodyText.includes('Select Tenant')) {
+      console.log('[login] Tenant selection page detected — picking first tenant …');
+      // Click the first tenant card (they are rendered as clickable rows/divs)
+      const firstTenant = await page.$('[class*="tenant-item"], [class*="tenantItem"], ul li, .list-group-item');
+      if (firstTenant) {
+        await firstTenant.click();
+      } else {
+        // Fallback: click the first element that looks like a tenant name
+        await page.click('text=/Chicago Parks|Demo MACRS|Georgia|Kansas|Massport|Mobile|PA/');
+      }
+      await page.waitForTimeout(3000);
+      await debugSnapshot(page, '02b_after_tenant_select');
+    }
+
     console.log('[login] Authenticated successfully.');
   } finally {
     await page.close();
@@ -100,73 +119,96 @@ async function login(ctx) {
 }
 
 // ---------------------------------------------------------------------------
-// Discover article links
+// Resolve a raw href into an absolute documentation URL
+// ---------------------------------------------------------------------------
+
+function resolveDocUrl(href, pageUrl) {
+  if (!href || href.startsWith('#') || href.startsWith('mailto:')) return null;
+
+  let resolved;
+  try {
+    resolved = new URL(href, pageUrl).href;
+  } catch (_) {
+    return null;
+  }
+
+  // Must be on the same host
+  if (!resolved.startsWith(BASE_URL)) return null;
+
+  // Must be a documentation page (not an asset or API path)
+  const pathname = new URL(resolved).pathname;
+  if (!pathname.startsWith('/documentation')) return null;
+
+  // Strip .md extension — the SPA serves the same page without it
+  resolved = resolved.replace(/\.md(#.*)?$/, (_, hash) => hash || '');
+
+  // Drop anchor fragments — we want the page URL only
+  resolved = resolved.split('#')[0].replace(/\/$/, '');
+
+  return resolved || null;
+}
+
+// ---------------------------------------------------------------------------
+// Collect all links visible on a single page
+// ---------------------------------------------------------------------------
+
+async function collectLinksFromPage(page) {
+  const pageUrl = page.url();
+  const rawHrefs = await page.evaluate(() =>
+    Array.from(document.querySelectorAll('a[href]')).map(a => a.getAttribute('href'))
+  );
+  return rawHrefs
+    .map(href => resolveDocUrl(href, pageUrl))
+    .filter(Boolean);
+}
+
+// ---------------------------------------------------------------------------
+// Discover article links — BFS crawl starting from the docs root
 // ---------------------------------------------------------------------------
 
 async function discoverArticleLinks(ctx) {
-  console.log(`\n[discover] Opening ${BASE_URL}${DOCS_PATH} …`);
+  const rootUrl = `${BASE_URL}/documentation`;
+  console.log(`\n[discover] Crawling from ${rootUrl} …`);
+
+  const visited = new Set();
+  const queue   = [rootUrl, `${BASE_URL}${DOCS_PATH}`];
+  const articleUrls = new Set();
+
   const page = await ctx.newPage();
 
   try {
-    await page.goto(`${BASE_URL}${DOCS_PATH}`, { waitUntil: 'domcontentloaded', timeout: TIMEOUT_MS });
-    await waitForContent(page);
-    await debugSnapshot(page, '03_discover_before_expand');
+    let crawlIndex = 0;
+    while (queue.length > 0) {
+      const url = queue.shift();
+      if (visited.has(url)) continue;
+      visited.add(url);
 
-    // Click any collapsed nav toggles
-    await page.evaluate(() => {
-      ['nav [aria-expanded="false"]', 'nav .collapsed', 'nav [class*="toggle"]',
-       'nav [class*="expand"]', 'aside [aria-expanded="false"]'].forEach(sel => {
-        document.querySelectorAll(sel).forEach(el => { try { el.click(); } catch (_) {} });
-      });
-    });
-    await page.waitForTimeout(800);
-    await debugSnapshot(page, '04_discover_after_expand');
+      crawlIndex++;
+      process.stdout.write(`  [crawl ${crawlIndex}] ${url}\n`);
 
-    // Pass 1: standard <a href> tags
-    const hrefs = await page.evaluate((base) =>
-      Array.from(document.querySelectorAll('a[href]'))
-        .map(a => {
-          const href = a.getAttribute('href') || '';
-          if (href.startsWith('/documentation') || href.startsWith(base + '/documentation'))
-            return href.startsWith('http') ? href : base + href;
-          return null;
-        })
-        .filter(Boolean),
-      BASE_URL
-    );
+      try {
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: TIMEOUT_MS });
+        await waitForContent(page);
 
-    // Pass 2: data-attribute hrefs (React Router etc.)
-    const dataHrefs = await page.evaluate((base) => {
-      const out = [];
-      document.querySelectorAll('[data-href],[data-url],[data-path],[data-link]').forEach(el => {
-        for (const attr of ['data-href', 'data-url', 'data-path', 'data-link']) {
-          const val = el.getAttribute(attr) || '';
-          if (val.includes('/documentation'))
-            out.push(val.startsWith('http') ? val : base + val);
+        if (crawlIndex <= 2) await debugSnapshot(page, `0${crawlIndex + 2}_crawl`);
+
+        const links = await collectLinksFromPage(page);
+
+        for (const link of links) {
+          articleUrls.add(link);
+          if (!visited.has(link)) queue.push(link);
         }
-      });
-      return out;
-    }, BASE_URL);
-
-    const unique = [...new Set([...hrefs, ...dataHrefs])];
-    console.log(`[discover] Found ${unique.length} article link(s).`);
-
-    if (unique.length === 0) {
-      const allAnchors = await page.evaluate(() =>
-        Array.from(document.querySelectorAll('a[href]')).map(a => ({
-          text: a.innerText.trim().slice(0, 60),
-          href: a.getAttribute('href'),
-        }))
-      );
-      console.log('[discover] All <a> tags on page (first 40):');
-      allAnchors.slice(0, 40).forEach(a => console.log(`  ${a.href}  "${a.text}"`));
-      if (DEBUG) fs.writeFileSync(path.join(DEBUG_DIR, 'all_anchors.json'), JSON.stringify(allAnchors, null, 2), 'utf8');
+      } catch (err) {
+        console.warn(`  [crawl skip] ${url}: ${err.message}`);
+      }
     }
-
-    return unique;
   } finally {
     await page.close();
   }
+
+  const unique = [...articleUrls];
+  console.log(`[discover] Found ${unique.length} article URL(s) across ${visited.size} page(s) crawled.`);
+  return unique;
 }
 
 // ---------------------------------------------------------------------------
